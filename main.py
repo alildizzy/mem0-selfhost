@@ -228,13 +228,16 @@ def update_memory(memory_id: str, updated_memory: Dict[str, Any]):
 
     Args:
         memory_id (str): ID of the memory to update
-        updated_memory (str): New content to update the memory with
+        updated_memory (dict): Body with 'data', 'text', or 'memory' string field
 
     Returns:
         dict: Success message indicating the memory was updated
     """
     try:
-        return MEMORY_INSTANCE.update(memory_id=memory_id, data=updated_memory)
+        data = updated_memory.get("data") or updated_memory.get("text") or updated_memory.get("memory")
+        if not data or not isinstance(data, str):
+            raise HTTPException(status_code=400, detail="Request body must include 'data', 'text', or 'memory' string field")
+        return MEMORY_INSTANCE.update(memory_id=memory_id, data=data)
     except Exception as e:
         logging.exception("Error in update_memory:")
         raise HTTPException(status_code=500, detail=str(e))
