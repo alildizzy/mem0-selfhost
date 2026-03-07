@@ -51,6 +51,7 @@ LLM_API_KEY = LLM_API_KEYS.get(LLM_PROVIDER, os.environ.get(f"{LLM_PROVIDER.uppe
 # Patch: Anthropic rejects temperature + top_p together.
 # AnthropicConfig defaults both to 0.1; intercept at the API call boundary.
 if LLM_PROVIDER == "anthropic":
+    import json as _json
     from mem0.llms.anthropic import AnthropicLLM
     _orig_generate = AnthropicLLM.generate_response
     def _patched_generate(self, messages, response_format=None, tools=None, tool_choice="auto", **kwargs):
@@ -61,7 +62,30 @@ if LLM_PROVIDER == "anthropic":
             return orig_create(**api_kwargs)
         self.client.messages.create = _filtered_create
         try:
-            return _orig_generate(self, messages, response_format, tools, tool_choice, **kwargs)
+            result = _orig_generate(self, messages, response_format, tools, tool_choice, **kwargs)
+            # If result is empty/None, check if Anthropic returned a tool_use block instead of text.
+            # mem0 passes tools for fact extraction; Anthropic responds with tool_use blocks,
+            # not text — causing "Expecting value" JSON parse errors downstream.
+            if not result:
+                # Re-call directly to inspect raw response
+                import anthropic as _anthropic
+                raw = orig_create(**{
+                    k: v for k, v in {
+                        "model": self.config.model,
+                        "messages": [m for m in messages if m.get("role") != "system"],
+                        "system": next((m["content"] for m in messages if m.get("role") == "system"), ""),
+                        "tools": tools,
+                        "tool_choice": tool_choice,
+                        "max_tokens": self.config.max_tokens or 2000,
+                        "temperature": self.config.temperature,
+                    }.items() if v is not None
+                })
+                for block in raw.content:
+                    if hasattr(block, "input"):  # tool_use block
+                        return _json.dumps(block.input)
+                    if hasattr(block, "text") and block.text:
+                        return block.text
+            return result
         finally:
             self.client.messages.create = orig_create
     AnthropicLLM.generate_response = _patched_generate
