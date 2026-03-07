@@ -1,75 +1,237 @@
 # mem0-selfhost
 
-Self-hosted Mem0 memory server for OpenClaw, running on WALL-E (Mac Studio).
+Self-hosted [Mem0](https://mem0.ai) memory server for OpenClaw agents, running on WALL-E (Mac Studio). Ships with a custom Anthropic Haiku LLM patch and multi-tenant user isolation out of the box.
 
 ## Why Self-Host?
 
-The `@mem0/openclaw-mem0` plugin's OSS mode uses sqlite3 for history storage, which fails under OpenClaw's jiti runtime due to native binding resolution issues ([openclaw/openclaw#31677](https://github.com/openclaw/openclaw/issues/31677), [mem0ai/mem0#4172](https://github.com/mem0ai/mem0/issues/4172)). Self-hosting bypasses sqlite3 entirely — OpenClaw hits the Mem0 HTTP API instead.
+The `@mem0/openclaw-mem0` plugin's OSS mode uses sqlite3 for history storage, which fails under OpenClaw's jiti runtime due to native binding resolution issues:
+
+- [openclaw/openclaw#31677](https://github.com/openclaw/openclaw/issues/31677) — OpenClaw jiti issue
+- [mem0ai/mem0#4172](https://github.com/mem0ai/mem0/issues/4172) — upstream mem0 sqlite3 issue
+
+Self-hosting bypasses sqlite3 entirely. OpenClaw hits a local HTTP API instead of importing the library.
 
 ## Stack
 
-| Service | Image | Port (host) | Purpose |
-|---------|-------|-------------|---------|
-| mem0 | mem0-selfhost:latest | 8888 | FastAPI REST API |
-| postgres | ankane/pgvector:v0.5.1 | 8432 | Vector store (pgvector) |
-| neo4j | neo4j:5.26.4 | 8474 (browser), 8687 (bolt) | Knowledge graph |
+| Service | Image | Host Port | Purpose |
+|---------|-------|-----------|---------|
+| `mem0` | `mem0-selfhost:latest` | `8888` | FastAPI REST API |
+| `postgres` | `ankane/pgvector:v0.5.1` | `8432` | Vector store (pgvector) |
+| `neo4j` | `neo4j:5.26.4` | `8474` / `8687` | Knowledge graph (**disabled** — see below) |
 
 ## Quick Start
 
-1. Copy `.env.example` to `.env` and add your OpenAI API key:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your key
-   ```
+```bash
+# 1. Clone and configure
+git clone https://github.com/alildizzy/mem0-selfhost
+cd mem0-selfhost
+cp .env.example .env
+# Edit .env — add ANTHROPIC_API_KEY and OPENAI_API_KEY
 
-2. Build and start:
-   ```bash
-   docker compose up -d --build
-   ```
+# 2. Build and start
+docker compose up -d --build
 
-3. Verify all services are healthy:
-   ```bash
-   docker compose ps
-   ```
+# 3. Verify
+docker compose ps
+curl http://localhost:8888/health
+```
 
-4. Test the API:
-   ```bash
-   curl http://localhost:8888/health
-   ```
+## Multi-User Setup
 
-## OpenClaw Integration
+Mem0 is **multi-tenant by `user_id`** — no extra configuration needed. Each agent or user simply passes a different `user_id` when calling the API. All memories are scoped and isolated per `user_id`.
 
-Once running, configure OpenClaw to use the self-hosted Mem0:
+### How it works
+
+```bash
+# Daphne stores a memory
+curl -X POST http://localhost:8888/memories \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "I love torch jazz"}], "user_id": "daphne-nightingale"}'
+
+# Pepper stores her own memory
+curl -X POST http://localhost:8888/memories \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "I prefer classical piano"}], "user_id": "pepper"}'
+
+# Search is scoped — Daphne only sees her memories
+curl -X POST http://localhost:8888/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "music preferences", "user_id": "daphne-nightingale"}'
+```
+
+### OpenClaw Agent Config
+
+Set `userId` per agent in your `openclaw.json` plugin config:
 
 ```json
 {
-  "mem0": {
-    "host": "http://localhost:8888"
+  "plugins": {
+    "@mem0/openclaw-mem0": {
+      "host": "http://localhost:8888",
+      "userId": "daphne-nightingale"
+    }
   }
 }
 ```
 
-The `@mem0/openclaw-mem0` plugin supports a `host` option that routes all API calls to the self-hosted server.
+For a different agent (e.g. Pepper), use a different `userId`:
+
+```json
+{
+  "plugins": {
+    "@mem0/openclaw-mem0": {
+      "host": "http://localhost:8888",
+      "userId": "pepper"
+    }
+  }
+}
+```
+
+That's it — no database partitioning, no extra config. `user_id` is the partition key.
+
+## Custom Anthropic LLM Patch
+
+Upstream mem0's `AnthropicConfig` defaults both `temperature` and `top_p`, but Anthropic's API rejects requests that set both simultaneously. Additionally, mem0 passes `tools` for fact extraction and expects a plain-text response, but Anthropic returns `tool_use` content blocks — which causes `"Expecting value"` JSON parse errors downstream.
+
+`main.py` patches both issues at startup:
+
+```python
+# Strips top_p when temperature is also set
+if "temperature" in api_kwargs and "top_p" in api_kwargs:
+    del api_kwargs["top_p"]
+
+# Handles tool_use response blocks — extracts .input as JSON
+for block in raw.content:
+    if hasattr(block, "input"):  # tool_use block
+        return json.dumps(block.input)
+```
+
+The patch is monkey-applied to `AnthropicLLM.generate_response` at import time. No upstream changes required.
+
+**Patched LLM:** `claude-haiku-4-5` (fast, cheap, effective for memory extraction).
+
+## Neo4j Status — Disabled
+
+Neo4j graph store is **disabled** in this deployment.
+
+**Root cause:** Upstream mem0's Cypher query generator produces node labels with hyphens (e.g. `daphne-nightingale`) which are invalid unquoted in Cypher. The graph store queries fail with syntax errors on any `user_id` containing a hyphen. This is an upstream bug with no patch yet.
+
+**Workaround:** `ENABLE_GRAPH` auto-disables when `LLM_PROVIDER=anthropic` (graph store uses OpenAI-style tool calling internally, incompatible with Anthropic's format). The neo4j container still starts (healthcheck gate for compose), but `main.py` never connects to it.
+
+To re-enable when upstream fixes land:
+
+```bash
+# In .env
+GRAPH_STORE_ENABLED=true
+# Then restart
+docker compose up -d mem0
+```
+
+## API Reference
+
+Base URL: `http://localhost:8888`
+
+Interactive docs: `http://localhost:8888/docs` (Swagger UI)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `POST` | `/memories` | Store new memories |
+| `GET` | `/memories?user_id=X` | Retrieve all memories for a user |
+| `GET` | `/memories/{id}` | Get a specific memory |
+| `PUT` | `/memories/{id}` | Update a memory |
+| `DELETE` | `/memories/{id}` | Delete a specific memory |
+| `DELETE` | `/memories?user_id=X` | Delete all memories for a user |
+| `POST` | `/search` | Semantic search across memories |
+| `GET` | `/memories/{id}/history` | Get revision history for a memory |
+| `POST` | `/reset` | Wipe all memories (destructive) |
+
+### Example: Store a memory
+
+```bash
+curl -X POST http://localhost:8888/memories \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "My favorite color is midnight blue"},
+      {"role": "assistant", "content": "I'll remember that!"}
+    ],
+    "user_id": "daphne-nightingale"
+  }'
+```
+
+### Example: Search memories
+
+```bash
+curl -X POST http://localhost:8888/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "color preferences", "user_id": "daphne-nightingale"}'
+```
+
+### Example: Delete all memories for a user
+
+```bash
+curl -X DELETE "http://localhost:8888/memories?user_id=daphne-nightingale"
+```
 
 ## Data Persistence
 
-- **PostgreSQL data**: Docker volume `postgres_db`
-- **Neo4j data**: Docker volume `neo4j_data`
-- **History**: Local `./history/` directory
+| What | Where |
+|------|-------|
+| Vector embeddings | Docker volume `postgres_db` |
+| Graph data | Docker volume `neo4j_data` (unused) |
+| History DB | `./history/history.db` (local bind mount) |
 
-To wipe everything and start fresh:
+Wipe everything and start fresh:
+
 ```bash
 docker compose down -v
+rm -rf history/history.db
+```
+
+## Troubleshooting
+
+**Port conflicts**
+
+Default ports: `8888` (mem0), `8432` (postgres), `8474`/`8687` (neo4j). If something's already listening, change the host-side ports in `docker-compose.yaml` or override via `.env`:
+
+```bash
+MEM0_PORT=9888
+POSTGRES_PORT=9432
+```
+
+**"ANTHROPIC_API_KEY not set"**
+
+Make sure `.env` has `ANTHROPIC_API_KEY=sk-ant-...` and you ran `docker compose up -d --build` (not just `up`).
+
+**Anthropic 400 errors / top_p conflicts**
+
+Already patched in `main.py`. If you see these, the container may be running old code — rebuild:
+
+```bash
+docker compose up -d --build mem0
+```
+
+**Services not starting**
+
+```bash
+docker compose logs mem0 --tail=50
+docker compose logs postgres --tail=20
+```
+
+**Reset a broken state**
+
+```bash
+docker compose down
+docker compose up -d --build
 ```
 
 ## Estimated Cost
 
-~$0.31/month (OpenAI API calls for gpt-4.1-nano extraction + text-embedding-3-small embeddings at typical usage).
+~$0.03–$0.10/day at typical usage:
+- **LLM:** Anthropic Haiku (fact extraction per memory add)
+- **Embeddings:** OpenAI `text-embedding-3-small`
 
-## Architecture
+---
 
-```
-OpenClaw → HTTP → Mem0 API (port 8888)
-                    ├── pgvector (embeddings)
-                    └── Neo4j (knowledge graph)
-```
+*Built and maintained by [Daphne Nightingale](https://dopaminesoundlabs.com) 🌺*
