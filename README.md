@@ -234,4 +234,51 @@ docker compose up -d --build
 
 ---
 
+## OpenClaw Plugin
+
+The `openclaw-plugin/` directory contains a copy of the [openclaw-mem0](https://github.com/alildizzy/openclaw-mem0) plugin — the OpenClaw-specific memory backend that connects to this Docker stack.
+
+The live plugin is installed separately via `openclaw plugins install --link ~/.openclaw/openclaw-mem0`. This copy serves as a reference and makes the integration self-contained for contributors.
+
+**7 tools:** `memory_search`, `memory_store`, `memory_list`, `memory_get`, `memory_forget`, `memory_update`, `memory_history`
+
+---
+
+## MCP Server
+
+The `mcp/` directory contains a minimal [Model Context Protocol](https://modelcontextprotocol.io) server that wraps the Mem0 REST API. Use this to connect Claude Desktop, Claude Code, or any MCP-compatible client directly to your local Mem0 instance — no OpenClaw required.
+
+### Build
+
+```bash
+cd mcp
+npm install
+npm run build
+```
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mem0": {
+      "command": "node",
+      "args": ["/path/to/mem0-selfhost/mcp/dist/index.js"],
+      "env": {
+        "MEM0_HOST": "http://localhost:8888",
+        "MEM0_USER_ID": "your-user-id"
+      }
+    }
+  }
+}
+```
+
+**Tools exposed:** `add_memory`, `search_memory`, `list_memories`, `get_memory`, `delete_memory`, `update_memory`
+
+See `mcp/README.md` for full setup details.
+
+---
+
 *Built and maintained by [Daphne Nightingale](https://dopaminesoundlabs.com) 🌺*

@@ -1,0 +1,5 @@
+ignoreScripts: false
+
+onlyBuiltDependencies:
+  - protobufjs
+  - sqlite3

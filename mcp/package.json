@@ -1,0 +1,21 @@
+{
+  "name": "@mem0/selfhost-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal MCP server for self-hosted Mem0 REST API",
+  "license": "Apache-2.0",
+  "bin": {
+    "mem0-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
