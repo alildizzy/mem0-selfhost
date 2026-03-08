@@ -3,3 +3,4 @@ history/
 *.pyc
 __pycache__/
 .DS_Store
+backups/
