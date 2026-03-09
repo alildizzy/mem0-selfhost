@@ -187,6 +187,7 @@ def get_all_memories(
     user_id: Optional[str] = None,
     run_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    limit: int = 100,
 ):
     """Retrieve stored memories."""
     if not any([user_id, run_id, agent_id]):
@@ -195,9 +196,31 @@ def get_all_memories(
         params = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
         }
-        return MEMORY_INSTANCE.get_all(**params)
+        return MEMORY_INSTANCE.get_all(**params, limit=limit)
     except Exception as e:
         logging.exception("Error in get_all_memories:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memories/count", summary="Count memories")
+def count_memories(
+    user_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+):
+    """Return total count of memories without the 100-result default limit."""
+    if not any([user_id, run_id, agent_id]):
+        raise HTTPException(status_code=400, detail="At least one identifier is required.")
+    try:
+        params = {
+            k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
+        }
+        result = MEMORY_INSTANCE.get_all(**params, limit=10000)
+        memories = result.get("results", []) if isinstance(result, dict) else result
+        relations = result.get("relations", []) if isinstance(result, dict) else []
+        return {"count": len(memories), "relations_count": len(relations)}
+    except Exception as e:
+        logging.exception("Error in count_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
