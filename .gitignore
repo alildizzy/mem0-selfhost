@@ -4,3 +4,7 @@ history/
 __pycache__/
 .DS_Store
 backups/
+dist/
+node_modules/
+coverage/
+*.log
