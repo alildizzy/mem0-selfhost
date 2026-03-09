@@ -37,12 +37,14 @@ Do not remove these — they fix upstream bugs:
 
 ## MCP Server
 
-```bash
-cd mcp && npm install && npm run build
-# Binary: mcp/dist/index.js
+Runs as a Docker service on port 3001 (Streamable HTTP). Starts with `docker compose up -d`.
+
+Claude Desktop config:
+```json
+{ "mcpServers": { "mem0": { "url": "http://localhost:3001/mcp" } } }
 ```
 
-Env vars: `MEM0_HOST` (default `http://localhost:8888`), `MEM0_USER_ID` (default `default`).
+Local build: `cd mcp && pnpm install && pnpm run build`
 
 ## Commit Convention
 

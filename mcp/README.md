@@ -1,6 +1,7 @@
 # mem0-selfhost MCP Server
 
-Minimal [Model Context Protocol](https://modelcontextprotocol.io) server that wraps the self-hosted Mem0 REST API. Lets Claude Desktop, Claude Code, or any MCP-compatible client use your local Mem0 instance directly.
+MCP server (Streamable HTTP) wrapping the self-hosted Mem0 REST API.
+Runs as a Docker service on port 3001 — start it with `docker compose up -d`.
 
 ## Tools
 
@@ -13,20 +14,20 @@ Minimal [Model Context Protocol](https://modelcontextprotocol.io) server that wr
 | `delete_memory` | Permanently delete a memory |
 | `update_memory` | Update an existing memory's text |
 
-## Setup
+## Endpoint
 
-```bash
-cd mcp
-npm install
-npm run build
+```
+http://localhost:3001/mcp   # Streamable HTTP (POST + GET)
+http://localhost:3001/health
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEM0_HOST` | `http://localhost:8888` | Mem0 REST API base URL |
+| `MEM0_HOST` | `http://mem0:8000` | Mem0 REST API (internal Docker network) |
 | `MEM0_USER_ID` | `default` | Default user ID if not specified per-call |
+| `MCP_PORT` | `3001` | Port to listen on |
 
 ## Claude Desktop Configuration
 
@@ -36,24 +37,21 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "mem0": {
-      "command": "node",
-      "args": ["/path/to/mem0-selfhost/mcp/dist/index.js"],
-      "env": {
-        "MEM0_HOST": "http://localhost:8888",
-        "MEM0_USER_ID": "daphne-nightingale"
-      }
+      "url": "http://localhost:3001/mcp"
     }
   }
 }
 ```
 
-## Claude Code (mcporter)
+## Local Development (without Docker)
 
 ```bash
-mcporter add mem0 --command "node /path/to/mem0-selfhost/mcp/dist/index.js" \
-  --env MEM0_HOST=http://localhost:8888
+cd mcp
+pnpm install
+pnpm run build
+MEM0_HOST=http://localhost:8888 node dist/index.js
 ```
 
 ## Requires
 
-Mem0 Docker stack running (`docker compose up -d` from repo root). See main [README](../README.md).
+Mem0 Docker stack running (`docker compose up -d` from repo root).

@@ -40,6 +40,29 @@ services:
       - LLM_MODEL=gpt-4.1-mini
       - EMBEDDER_MODEL=text-embedding-3-small
 
+  mcp:
+    build:
+      context: ./mcp
+    image: mem0-mcp:latest
+    restart: on-failure
+    ports:
+      - "3001:3001"
+    networks:
+      - mem0_network
+    depends_on:
+      mem0:
+        condition: service_healthy
+    environment:
+      - MEM0_HOST=http://mem0:8000
+      - MEM0_USER_ID=default
+      - MCP_PORT=3001
+    healthcheck:
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
   postgres:
     image: ankane/pgvector:v0.5.1
     restart: on-failure

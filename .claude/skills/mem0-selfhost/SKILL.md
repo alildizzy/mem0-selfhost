@@ -42,12 +42,14 @@ git push
 
 6 tools: `add_memory`, `search_memory`, `list_memories`, `get_memory`, `delete_memory`, `update_memory`.
 
-**Build:**
+Runs as a Docker service (Streamable HTTP transport) on port 3001. Starts automatically with `docker compose up -d`.
+
+**Local build (without Docker):**
 ```bash
 cd ~/mem0-selfhost/mcp
-npm install
-npm run build
-# Binary: dist/index.js
+pnpm install
+pnpm run build
+MEM0_HOST=http://localhost:8888 node dist/index.js
 ```
 
 **Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
@@ -55,18 +57,13 @@ npm run build
 {
   "mcpServers": {
     "mem0": {
-      "command": "node",
-      "args": ["/Users/jonathanirvin/mem0-selfhost/mcp/dist/index.js"],
-      "env": {
-        "MEM0_HOST": "http://localhost:8888",
-        "MEM0_USER_ID": "default"
-      }
+      "url": "http://localhost:3001/mcp"
     }
   }
 }
 ```
 
-**Env vars:** `MEM0_HOST` (default `http://localhost:8888`), `MEM0_USER_ID` (default `default`).
+**Env vars:** `MEM0_HOST` (default `http://mem0:8000`), `MEM0_USER_ID` (default `default`), `MCP_PORT` (default `3001`).
 
 ## Test the API
 
