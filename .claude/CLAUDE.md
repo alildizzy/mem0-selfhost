@@ -30,7 +30,7 @@ mem0-selfhost/
 |---------|------|---------|
 | `mem0` | 8888 | FastAPI REST API |
 | `postgres` | 8432 | Vector store (pgvector) |
-| `neo4j` | — | **Disabled** — Cypher hyphen-escaping bug |
+| `neo4j` | 7687 | **Enabled** — bugs patched in `main.py` |
 
 ## Common Commands
 
@@ -53,14 +53,15 @@ curl http://localhost:8888/memories?user_id=daphne-nightingale&limit=5
 
 ## Key Notes
 
-- **LLM:** Anthropic Haiku (`claude-haiku-4-5`) for fact extraction — patched in `main.py` to handle `tool_use` responses and `top_p`+`temperature` conflicts
-- **Neo4j:** Disabled — don't re-enable without fixing upstream Cypher bug first
+- **LLM:** OpenAI (`gpt-4.1-mini`) for fact extraction — `main.py` retains Anthropic patches (`tool_use`, `top_p` conflict) if provider is switched back
+- **Neo4j:** Enabled — `main.py` monkeypatches `sanitize_relationship_for_cypher` (allowlist regex) and `_remove_spaces_from_entities` (missing-key guard) to fix upstream Cypher bugs
 - **Port 8888:** Hardcoded in the OpenClaw plugin (`openclaw-mem0`) — don't change without updating both
 - **Git identity:** All commits as `Daphne Nightingale <daphne@dopaminesoundlabs.com>` with `--no-gpg-sign`
 - **Never merge PRs** without Jonathan's review
 
 ## Related
 
+- Skill file: `.claude/skills/mem0-selfhost/SKILL.md`
 - OpenClaw plugin source: `~/.openclaw/openclaw-mem0/` (symlinked into OpenClaw runtime)
 - Plugin repo: `https://github.com/alildizzy/openclaw-mem0` (private)
 - MCP docs: `mcp/README.md`

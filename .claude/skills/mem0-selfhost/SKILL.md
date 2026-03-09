@@ -38,14 +38,35 @@ git commit --author="Daphne Nightingale <daphne@dopaminesoundlabs.com>" --no-gpg
 git push
 ```
 
-## Build the MCP Server
+## MCP Server
 
+6 tools: `add_memory`, `search_memory`, `list_memories`, `get_memory`, `delete_memory`, `update_memory`.
+
+**Build:**
 ```bash
 cd ~/mem0-selfhost/mcp
 npm install
 npm run build
 # Binary: dist/index.js
 ```
+
+**Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "mem0": {
+      "command": "node",
+      "args": ["/Users/jonathanirvin/mem0-selfhost/mcp/dist/index.js"],
+      "env": {
+        "MEM0_HOST": "http://localhost:8888",
+        "MEM0_USER_ID": "default"
+      }
+    }
+  }
+}
+```
+
+**Env vars:** `MEM0_HOST` (default `http://localhost:8888`), `MEM0_USER_ID` (default `default`).
 
 ## Test the API
 
@@ -83,7 +104,7 @@ docker compose restart mem0
 
 ## Known Issues
 
-- **Neo4j disabled** — Cypher hyphen-escaping bug in upstream mem0. Don't re-enable.
+- **Neo4j enabled** — upstream Cypher bugs are monkeypatched in `main.py` (`sanitize_relationship_for_cypher` allowlist regex + `_remove_spaces_from_entities` missing-key guard). Don't remove these patches.
 - **Port 8888** — hardcoded in openclaw-mem0 plugin. Changing it requires updating both.
 - **top_p + temperature conflict** — patched in `main.py`. Don't remove the `_filtered_create` wrapper.
 

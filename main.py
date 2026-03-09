@@ -92,10 +92,49 @@ if LLM_PROVIDER == "anthropic":
 
 # Graph store uses OpenAI-style tool calling internally (function format, string tool_choice,
 # response.tool_calls parsing). Incompatible with Anthropic. Disable when using Anthropic.
-ENABLE_GRAPH = os.environ.get("ENABLE_GRAPH", "true").lower() == "true"
+ENABLE_GRAPH = os.environ.get("GRAPH_STORE_ENABLED", "true").lower() == "true"
 if LLM_PROVIDER == "anthropic":
     ENABLE_GRAPH = False
     logging.info("Graph store disabled (incompatible with Anthropic tool calling format)")
+
+# Patch: upstream sanitize_relationship_for_cypher uses a blocklist that misses ASCII commas,
+# periods, hyphens, etc. Replace with allowlist — Cypher relationship types only permit [a-zA-Z0-9_].
+import re as _re
+import mem0.memory.utils as _mem0_utils
+def _strict_sanitize(relationship: str) -> str:
+    sanitized = _re.sub(r"[^a-zA-Z0-9_]", "_", relationship)
+    sanitized = _re.sub(r"_+", "_", sanitized)
+    return sanitized.strip("_")
+_mem0_utils.sanitize_relationship_for_cypher = _strict_sanitize
+
+# Patch: upstream _remove_spaces_from_entities crashes with KeyError when
+# the LLM returns entities missing 'source', 'relationship', or 'destination'.
+from mem0.memory.graph_memory import MemoryGraph as _MemoryGraph
+def _coerce_to_str(value):
+    """Coerce a value to string — LLM sometimes returns lists instead of strings."""
+    if isinstance(value, list):
+        return " ".join(str(v) for v in value)
+    return str(value)
+
+def _safe_remove_spaces(self, entity_list):
+    cleaned = []
+    for item in entity_list:
+        # Fix LLM returning destination as a dynamic key, e.g. {'source': X, 'relationship': Y, '#18': '#18'}
+        if "destination" not in item:
+            extra_keys = set(item.keys()) - {"source", "relationship", "destination", "source_type", "destination_type"}
+            if len(extra_keys) == 1 and "source" in item and "relationship" in item:
+                bad_key = extra_keys.pop()
+                item["destination"] = item.pop(bad_key)
+                logging.info(f"Recovered malformed entity: mapped key '{bad_key}' to 'destination'")
+        if not all(k in item for k in ("source", "relationship", "destination")):
+            logging.warning(f"Skipping malformed entity (missing keys): {item}")
+            continue
+        item["source"] = _coerce_to_str(item["source"]).lower().replace(" ", "_")
+        item["relationship"] = _strict_sanitize(_coerce_to_str(item["relationship"]).lower().replace(" ", "_"))
+        item["destination"] = _coerce_to_str(item["destination"]).lower().replace(" ", "_")
+        cleaned.append(item)
+    return cleaned
+_MemoryGraph._remove_spaces_from_entities = _safe_remove_spaces
 
 logging.info(f"LLM: {LLM_PROVIDER}/{LLM_MODEL} | Embedder: {EMBEDDER_PROVIDER}/{EMBEDDER_MODEL} | Graph: {ENABLE_GRAPH}")
 
