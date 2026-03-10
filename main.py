@@ -90,6 +90,55 @@ if LLM_PROVIDER == "anthropic":
             self.client.messages.create = orig_create
     AnthropicLLM.generate_response = _patched_generate
 
+# Patch: OpenAI LLM _parse_response does a bare json.loads on tool_call.function.arguments
+# which crashes when the model returns malformed JSON (common with long entity extraction).
+# Wrap it to attempt repair and gracefully skip unrecoverable tool calls.
+import json as _json
+from mem0.llms.openai import OpenAILLM as _OpenAILLM
+from mem0.memory.utils import extract_json as _extract_json
+
+_orig_parse_response = _OpenAILLM._parse_response
+
+def _safe_parse_response(self, response, tools):
+    if not tools:
+        return response.choices[0].message.content
+
+    processed = {"content": response.choices[0].message.content, "tool_calls": []}
+    if response.choices[0].message.tool_calls:
+        for tool_call in response.choices[0].message.tool_calls:
+            raw_args = _extract_json(tool_call.function.arguments)
+            try:
+                parsed = _json.loads(raw_args)
+            except _json.JSONDecodeError:
+                # Attempt basic repair: truncate to last complete JSON object/array
+                repaired = _try_repair_json(raw_args)
+                if repaired is not None:
+                    parsed = repaired
+                    logging.warning(f"Repaired malformed tool_call JSON for '{tool_call.function.name}'")
+                else:
+                    logging.warning(
+                        f"Skipping tool_call '{tool_call.function.name}' — unrecoverable JSON: "
+                        f"...{raw_args[-80:]}"
+                    )
+                    continue
+            processed["tool_calls"].append({"name": tool_call.function.name, "arguments": parsed})
+    return processed
+
+def _try_repair_json(raw: str):
+    """Attempt to salvage truncated or slightly malformed JSON."""
+    # Strategy 1: the string is truncated mid-object — find last balanced closing brace
+    for end_char in ('}', ']'):
+        idx = raw.rfind(end_char)
+        if idx > 0:
+            candidate = raw[:idx + 1]
+            try:
+                return _json.loads(candidate)
+            except _json.JSONDecodeError:
+                pass
+    return None
+
+_OpenAILLM._parse_response = _safe_parse_response
+
 # Graph store uses OpenAI-style tool calling internally (function format, string tool_choice,
 # response.tool_calls parsing). Incompatible with Anthropic. Disable when using Anthropic.
 ENABLE_GRAPH = os.environ.get("GRAPH_STORE_ENABLED", "true").lower() == "true"
