@@ -3,7 +3,8 @@ import logging
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
+from contextvars import ContextVar
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
@@ -41,10 +42,14 @@ logging.root.setLevel(logging.INFO)
 logger = logging.getLogger("mem0")
 
 
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+
 def log_with_data(level: int, msg: str, **kwargs):
     record = logger.makeRecord(
         logger.name, level, "(mem0)", 0, msg, (), None,
     )
+    kwargs["request_id"] = request_id_var.get()
     record.extra_data = kwargs
     logger.handle(record)
 
@@ -52,24 +57,37 @@ def log_with_data(level: int, msg: str, **kwargs):
 # ---------------------------------------------------------------------------
 # In-memory throughput metrics
 # ---------------------------------------------------------------------------
+RPM_WINDOW_S = 60
+
 class Metrics:
     def __init__(self):
         self._lock = Lock()
         self._counts: Dict[str, int] = defaultdict(int)
         self._durations: Dict[str, float] = defaultdict(float)
         self._errors: Dict[str, int] = defaultdict(int)
+        self._timestamps: Dict[str, deque] = defaultdict(deque)
         self._start_time = time.time()
 
     def record(self, operation: str, duration_ms: float, error: bool = False):
+        now = time.time()
         with self._lock:
             self._counts[operation] += 1
             self._durations[operation] += duration_ms
+            self._timestamps[operation].append(now)
             if error:
                 self._errors[operation] += 1
 
+    def _rolling_rpm(self, operation: str, now: float) -> float:
+        dq = self._timestamps[operation]
+        cutoff = now - RPM_WINDOW_S
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        return round(len(dq) * (60 / RPM_WINDOW_S), 1)
+
     def snapshot(self) -> dict:
+        now = time.time()
         with self._lock:
-            uptime = time.time() - self._start_time
+            uptime = now - self._start_time
             ops = {}
             for op in self._counts:
                 count = self._counts[op]
@@ -78,7 +96,7 @@ class Metrics:
                     "errors": self._errors.get(op, 0),
                     "total_ms": round(self._durations[op], 1),
                     "avg_ms": round(self._durations[op] / count, 1) if count else 0,
-                    "rpm": round(count / (uptime / 60), 1) if uptime > 0 else 0,
+                    "rpm": self._rolling_rpm(op, now),
                 }
             return {"uptime_s": round(uptime, 1), "operations": ops}
 
@@ -214,21 +232,42 @@ def _try_repair_json(raw: str):
 _OpenAILLM._parse_response = _safe_parse_response
 
 # ---------------------------------------------------------------------------
-# LLM call instrumentation — wrap generate_response to log latency and tokens
+# LLM call instrumentation — intercept at the OpenAI client level for real
+# token counts, then wrap generate_response for latency.
 # ---------------------------------------------------------------------------
+
+# Stash raw API response on the instance so we can read usage after generate_response.
+_orig_openai_init = _OpenAILLM.__init__
+
+def _patched_openai_init(self, *args, **kwargs):
+    _orig_openai_init(self, *args, **kwargs)
+    orig_create = self.client.chat.completions.create
+    def _capturing_create(**api_kwargs):
+        response = orig_create(**api_kwargs)
+        self._raw_response = response
+        return response
+    self.client.chat.completions.create = _capturing_create
+    self._raw_response = None
+
+_OpenAILLM.__init__ = _patched_openai_init
+
 _orig_openai_generate = _OpenAILLM.generate_response
 
 def _instrumented_openai_generate(self, messages, response_format=None, tools=None, tool_choice="auto"):
+    self._raw_response = None
     start = time.perf_counter()
     try:
         result = _orig_openai_generate(self, messages, response_format, tools, tool_choice)
         duration_ms = (time.perf_counter() - start) * 1000
 
         usage = {}
-        if hasattr(self, '_last_response') and self._last_response:
-            u = getattr(self._last_response, 'usage', None)
-            if u:
-                usage = {"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens}
+        raw = getattr(self, '_raw_response', None)
+        if raw and hasattr(raw, 'usage') and raw.usage:
+            usage = {
+                "prompt_tokens": raw.usage.prompt_tokens,
+                "completion_tokens": raw.usage.completion_tokens,
+                "total_tokens": raw.usage.total_tokens,
+            }
 
         log_with_data(logging.DEBUG, "llm_call",
             provider="openai", model=self.config.model,
@@ -352,6 +391,7 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         request_id = str(uuid.uuid4())[:8]
+        request_id_var.set(request_id)
         start = time.perf_counter()
 
         response = await call_next(request)
@@ -645,7 +685,7 @@ def delete_all_memories(
         duration_ms = (time.perf_counter() - start) * 1000
 
         log_with_data(logging.WARNING, "memory_delete_all",
-            user_id=user_id, duration_ms=round(duration_ms, 1),
+            **params, duration_ms=round(duration_ms, 1),
         )
         metrics.record("delete_all", duration_ms)
         return {"message": "All relevant memories deleted"}
