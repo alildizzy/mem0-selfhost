@@ -36,11 +36,12 @@ function buildServer(): McpServer {
     "Store a new memory for a user.",
     {
       text: z.string().describe("The memory content to store."),
+      role: z.enum(["user", "assistant"]).optional().describe("Who produced this memory: 'user' for things the user said, 'assistant' for things you observed/learned. Defaults to 'user'."),
       user_id: z.string().optional().describe("User ID to scope the memory."),
     },
-    async ({ text, user_id }) => {
+    async ({ text, role, user_id }) => {
       const result = await mem0("POST", "/memories", {
-        messages: [{ role: "user", content: text }],
+        messages: [{ role: role ?? "user", content: text }],
         user_id: user_id ?? DEFAULT_USER_ID,
       });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
