@@ -1,15 +1,89 @@
+import json as _json_stdlib
 import logging
 import os
+import time
+import uuid
+from collections import defaultdict
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from mem0 import Memory
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ---------------------------------------------------------------------------
+# Structured JSON logging
+# ---------------------------------------------------------------------------
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            "logger": record.name,
+        }
+        if record.exc_info and record.exc_info[0] is not None:
+            entry["exception"] = self.formatException(record.exc_info)
+        if hasattr(record, "extra_data"):
+            entry.update(record.extra_data)
+        return _json_stdlib.dumps(entry, default=str)
+
+
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
+logging.root.handlers = [handler]
+logging.root.setLevel(logging.INFO)
+logger = logging.getLogger("mem0")
+
+
+def log_with_data(level: int, msg: str, **kwargs):
+    record = logger.makeRecord(
+        logger.name, level, "(mem0)", 0, msg, (), None,
+    )
+    record.extra_data = kwargs
+    logger.handle(record)
+
+
+# ---------------------------------------------------------------------------
+# In-memory throughput metrics
+# ---------------------------------------------------------------------------
+class Metrics:
+    def __init__(self):
+        self._lock = Lock()
+        self._counts: Dict[str, int] = defaultdict(int)
+        self._durations: Dict[str, float] = defaultdict(float)
+        self._errors: Dict[str, int] = defaultdict(int)
+        self._start_time = time.time()
+
+    def record(self, operation: str, duration_ms: float, error: bool = False):
+        with self._lock:
+            self._counts[operation] += 1
+            self._durations[operation] += duration_ms
+            if error:
+                self._errors[operation] += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            uptime = time.time() - self._start_time
+            ops = {}
+            for op in self._counts:
+                count = self._counts[op]
+                ops[op] = {
+                    "count": count,
+                    "errors": self._errors.get(op, 0),
+                    "total_ms": round(self._durations[op], 1),
+                    "avg_ms": round(self._durations[op] / count, 1) if count else 0,
+                    "rpm": round(count / (uptime / 60), 1) if uptime > 0 else 0,
+                }
+            return {"uptime_s": round(uptime, 1), "operations": ops}
+
+
+metrics = Metrics()
 
 # Load environment variables
 load_dotenv()
@@ -114,9 +188,9 @@ def _safe_parse_response(self, response, tools):
                 repaired = _try_repair_json(raw_args)
                 if repaired is not None:
                     parsed = repaired
-                    logging.warning(f"Repaired malformed tool_call JSON for '{tool_call.function.name}'")
+                    logger.warning(f"Repaired malformed tool_call JSON for '{tool_call.function.name}'")
                 else:
-                    logging.warning(
+                    logger.warning(
                         f"Skipping tool_call '{tool_call.function.name}' — unrecoverable JSON: "
                         f"...{raw_args[-80:]}"
                     )
@@ -139,12 +213,49 @@ def _try_repair_json(raw: str):
 
 _OpenAILLM._parse_response = _safe_parse_response
 
+# ---------------------------------------------------------------------------
+# LLM call instrumentation — wrap generate_response to log latency and tokens
+# ---------------------------------------------------------------------------
+_orig_openai_generate = _OpenAILLM.generate_response
+
+def _instrumented_openai_generate(self, messages, response_format=None, tools=None, tool_choice="auto"):
+    start = time.perf_counter()
+    try:
+        result = _orig_openai_generate(self, messages, response_format, tools, tool_choice)
+        duration_ms = (time.perf_counter() - start) * 1000
+
+        usage = {}
+        if hasattr(self, '_last_response') and self._last_response:
+            u = getattr(self._last_response, 'usage', None)
+            if u:
+                usage = {"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens}
+
+        log_with_data(logging.DEBUG, "llm_call",
+            provider="openai", model=self.config.model,
+            has_tools=bool(tools),
+            duration_ms=round(duration_ms, 1),
+            **usage,
+        )
+        metrics.record("llm_call", duration_ms)
+        return result
+    except Exception as e:
+        duration_ms = (time.perf_counter() - start) * 1000
+        log_with_data(logging.ERROR, "llm_call_error",
+            provider="openai", model=self.config.model,
+            error=str(e),
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("llm_call", duration_ms, error=True)
+        raise
+
+_OpenAILLM.generate_response = _instrumented_openai_generate
+
 # Graph store uses OpenAI-style tool calling internally (function format, string tool_choice,
 # response.tool_calls parsing). Incompatible with Anthropic. Disable when using Anthropic.
 ENABLE_GRAPH = os.environ.get("GRAPH_STORE_ENABLED", "true").lower() == "true"
 if LLM_PROVIDER == "anthropic":
     ENABLE_GRAPH = False
-    logging.info("Graph store disabled (incompatible with Anthropic tool calling format)")
+    logger.info("Graph store disabled (incompatible with Anthropic tool calling format)")
 
 # Patch: upstream sanitize_relationship_for_cypher uses a blocklist that misses ASCII commas,
 # periods, hyphens, etc. Replace with allowlist — Cypher relationship types only permit [a-zA-Z0-9_].
@@ -174,9 +285,9 @@ def _safe_remove_spaces(self, entity_list):
             if len(extra_keys) == 1 and "source" in item and "relationship" in item:
                 bad_key = extra_keys.pop()
                 item["destination"] = item.pop(bad_key)
-                logging.info(f"Recovered malformed entity: mapped key '{bad_key}' to 'destination'")
+                logger.info(f"Recovered malformed entity: mapped key '{bad_key}' to 'destination'")
         if not all(k in item for k in ("source", "relationship", "destination")):
-            logging.warning(f"Skipping malformed entity (missing keys): {item}")
+            logger.warning(f"Skipping malformed entity (missing keys): {item}")
             continue
         item["source"] = _coerce_to_str(item["source"]).lower().replace(" ", "_")
         item["relationship"] = _strict_sanitize(_coerce_to_str(item["relationship"]).lower().replace(" ", "_"))
@@ -185,7 +296,11 @@ def _safe_remove_spaces(self, entity_list):
     return cleaned
 _MemoryGraph._remove_spaces_from_entities = _safe_remove_spaces
 
-logging.info(f"LLM: {LLM_PROVIDER}/{LLM_MODEL} | Embedder: {EMBEDDER_PROVIDER}/{EMBEDDER_MODEL} | Graph: {ENABLE_GRAPH}")
+log_with_data(logging.INFO, "Configuration loaded",
+    llm_provider=LLM_PROVIDER, llm_model=LLM_MODEL,
+    embedder_provider=EMBEDDER_PROVIDER, embedder_model=EMBEDDER_MODEL,
+    graph_enabled=ENABLE_GRAPH,
+)
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -226,6 +341,43 @@ app = FastAPI(
 )
 
 
+# ---------------------------------------------------------------------------
+# Request/response logging middleware
+# ---------------------------------------------------------------------------
+SKIP_LOG_PATHS = {"/health", "/", "/docs", "/openapi.json", "/favicon.ico"}
+
+class ObservabilityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in SKIP_LOG_PATHS:
+            return await call_next(request)
+
+        request_id = str(uuid.uuid4())[:8]
+        start = time.perf_counter()
+
+        response = await call_next(request)
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        operation = f"{request.method} {request.url.path}"
+        is_error = response.status_code >= 400
+
+        metrics.record(operation, duration_ms, error=is_error)
+
+        log_with_data(
+            logging.WARNING if is_error else logging.INFO,
+            f"{request.method} {request.url.path} → {response.status_code}",
+            request_id=request_id,
+            method=request.method,
+            path=str(request.url.path),
+            query=str(request.url.query) if request.url.query else None,
+            status=response.status_code,
+            duration_ms=round(duration_ms, 1),
+        )
+        return response
+
+
+app.add_middleware(ObservabilityMiddleware)
+
+
 class Message(BaseModel):
     role: str = Field(..., description="Role of the message (user or assistant).")
     content: str = Field(..., description="Message content.")
@@ -262,11 +414,42 @@ def add_memory(memory_create: MemoryCreate):
         raise HTTPException(status_code=400, detail="At least one identifier (user_id, agent_id, run_id) is required.")
 
     params = {k: v for k, v in memory_create.model_dump().items() if v is not None and k != "messages"}
+    roles = [m.role for m in memory_create.messages]
+    input_chars = sum(len(m.content) for m in memory_create.messages)
+
+    start = time.perf_counter()
     try:
         response = MEMORY_INSTANCE.add(messages=[m.model_dump() for m in memory_create.messages], **params)
+        duration_ms = (time.perf_counter() - start) * 1000
+
+        facts_added = len(response.get("results", [])) if isinstance(response, dict) else 0
+        relations = response.get("relations", {}) if isinstance(response, dict) else {}
+        entities_added = len(relations.get("added_entities", []))
+        entities_deleted = len(relations.get("deleted_entities", []))
+
+        log_with_data(logging.INFO, "memory_add",
+            user_id=memory_create.user_id,
+            agent_id=memory_create.agent_id,
+            roles=roles,
+            input_chars=input_chars,
+            facts_added=facts_added,
+            entities_added=entities_added,
+            entities_deleted=entities_deleted,
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("add_memory", duration_ms)
         return JSONResponse(content=response)
     except Exception as e:
-        logging.exception("Error in add_memory:")  # This will log the full traceback
+        duration_ms = (time.perf_counter() - start) * 1000
+        log_with_data(logging.ERROR, "memory_add_error",
+            user_id=memory_create.user_id,
+            roles=roles,
+            input_chars=input_chars,
+            error=str(e),
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("add_memory", duration_ms, error=True)
+        logger.exception("Error in add_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -280,13 +463,26 @@ def get_all_memories(
     """Retrieve stored memories."""
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
+    start = time.perf_counter()
     try:
         params = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
         }
-        return MEMORY_INSTANCE.get_all(**params, limit=limit)
+        result = MEMORY_INSTANCE.get_all(**params, limit=limit)
+        duration_ms = (time.perf_counter() - start) * 1000
+        result_count = len(result.get("results", [])) if isinstance(result, dict) else 0
+
+        log_with_data(logging.INFO, "memory_list",
+            user_id=user_id, limit=limit,
+            result_count=result_count,
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("list_memories", duration_ms)
+        return result
     except Exception as e:
-        logging.exception("Error in get_all_memories:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("list_memories", duration_ms, error=True)
+        logger.exception("Error in get_all_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -299,6 +495,7 @@ def count_memories(
     """Return total count of memories without the 100-result default limit."""
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
+    start = time.perf_counter()
     try:
         params = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
@@ -306,72 +503,127 @@ def count_memories(
         result = MEMORY_INSTANCE.get_all(**params, limit=10000)
         memories = result.get("results", []) if isinstance(result, dict) else result
         relations = result.get("relations", []) if isinstance(result, dict) else []
-        return {"count": len(memories), "relations_count": len(relations)}
+        duration_ms = (time.perf_counter() - start) * 1000
+        count = len(memories)
+        rel_count = len(relations)
+
+        log_with_data(logging.INFO, "memory_count",
+            user_id=user_id, count=count, relations_count=rel_count,
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("count_memories", duration_ms)
+        return {"count": count, "relations_count": rel_count}
     except Exception as e:
-        logging.exception("Error in count_memories:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("count_memories", duration_ms, error=True)
+        logger.exception("Error in count_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/memories/{memory_id}", summary="Get a memory")
 def get_memory(memory_id: str):
     """Retrieve a specific memory by ID."""
+    start = time.perf_counter()
     try:
-        return MEMORY_INSTANCE.get(memory_id)
+        result = MEMORY_INSTANCE.get(memory_id)
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("get_memory", duration_ms)
+        return result
     except Exception as e:
-        logging.exception("Error in get_memory:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("get_memory", duration_ms, error=True)
+        logger.exception("Error in get_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/search", summary="Search memories")
 def search_memories(search_req: SearchRequest):
     """Search for memories based on a query."""
+    start = time.perf_counter()
     try:
         params = {k: v for k, v in search_req.model_dump().items() if v is not None and k != "query"}
-        return MEMORY_INSTANCE.search(query=search_req.query, **params)
+        result = MEMORY_INSTANCE.search(query=search_req.query, **params)
+        duration_ms = (time.perf_counter() - start) * 1000
+
+        result_count = len(result.get("results", [])) if isinstance(result, dict) else 0
+        top_score = None
+        if isinstance(result, dict) and result.get("results"):
+            top_score = result["results"][0].get("score")
+
+        log_with_data(logging.INFO, "memory_search",
+            user_id=search_req.user_id,
+            query=search_req.query[:100],
+            result_count=result_count,
+            top_score=round(top_score, 3) if top_score is not None else None,
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("search_memory", duration_ms)
+        return result
     except Exception as e:
-        logging.exception("Error in search_memories:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("search_memory", duration_ms, error=True)
+        logger.exception("Error in search_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/memories/{memory_id}", summary="Update a memory")
 def update_memory(memory_id: str, updated_memory: Dict[str, Any]):
-    """Update an existing memory with new content.
-
-    Args:
-        memory_id (str): ID of the memory to update
-        updated_memory (dict): Body with 'data', 'text', or 'memory' string field
-
-    Returns:
-        dict: Success message indicating the memory was updated
-    """
+    """Update an existing memory with new content."""
+    start = time.perf_counter()
     try:
         data = updated_memory.get("data") or updated_memory.get("text") or updated_memory.get("memory")
         if not data or not isinstance(data, str):
             raise HTTPException(status_code=400, detail="Request body must include 'data', 'text', or 'memory' string field")
-        return MEMORY_INSTANCE.update(memory_id=memory_id, data=data)
+        result = MEMORY_INSTANCE.update(memory_id=memory_id, data=data)
+        duration_ms = (time.perf_counter() - start) * 1000
+
+        log_with_data(logging.INFO, "memory_update",
+            memory_id=memory_id, input_chars=len(data),
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("update_memory", duration_ms)
+        return result
     except Exception as e:
-        logging.exception("Error in update_memory:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("update_memory", duration_ms, error=True)
+        logger.exception("Error in update_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/memories/{memory_id}/history", summary="Get memory history")
 def memory_history(memory_id: str):
     """Retrieve memory history."""
+    start = time.perf_counter()
     try:
-        return MEMORY_INSTANCE.history(memory_id=memory_id)
+        result = MEMORY_INSTANCE.history(memory_id=memory_id)
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("memory_history", duration_ms)
+        return result
     except Exception as e:
-        logging.exception("Error in memory_history:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("memory_history", duration_ms, error=True)
+        logger.exception("Error in memory_history:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/memories/{memory_id}", summary="Delete a memory")
 def delete_memory(memory_id: str):
     """Delete a specific memory by ID."""
+    start = time.perf_counter()
     try:
         MEMORY_INSTANCE.delete(memory_id=memory_id)
+        duration_ms = (time.perf_counter() - start) * 1000
+
+        log_with_data(logging.INFO, "memory_delete",
+            memory_id=memory_id,
+            duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("delete_memory", duration_ms)
         return {"message": "Memory deleted successfully"}
     except Exception as e:
-        logging.exception("Error in delete_memory:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("delete_memory", duration_ms, error=True)
+        logger.exception("Error in delete_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -384,26 +636,50 @@ def delete_all_memories(
     """Delete all memories for a given identifier."""
     if not any([user_id, run_id, agent_id]):
         raise HTTPException(status_code=400, detail="At least one identifier is required.")
+    start = time.perf_counter()
     try:
         params = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
         }
         MEMORY_INSTANCE.delete_all(**params)
+        duration_ms = (time.perf_counter() - start) * 1000
+
+        log_with_data(logging.WARNING, "memory_delete_all",
+            user_id=user_id, duration_ms=round(duration_ms, 1),
+        )
+        metrics.record("delete_all", duration_ms)
         return {"message": "All relevant memories deleted"}
     except Exception as e:
-        logging.exception("Error in delete_all_memories:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("delete_all", duration_ms, error=True)
+        logger.exception("Error in delete_all_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/reset", summary="Reset all memories")
 def reset_memory():
     """Completely reset stored memories."""
+    start = time.perf_counter()
     try:
         MEMORY_INSTANCE.reset()
+        duration_ms = (time.perf_counter() - start) * 1000
+        log_with_data(logging.WARNING, "memory_reset", duration_ms=round(duration_ms, 1))
+        metrics.record("reset", duration_ms)
         return {"message": "All memories reset"}
     except Exception as e:
-        logging.exception("Error in reset_memory:")
+        duration_ms = (time.perf_counter() - start) * 1000
+        metrics.record("reset", duration_ms, error=True)
+        logger.exception("Error in reset_memory:")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Metrics endpoint — GET /metrics for throughput/latency dashboard
+# ---------------------------------------------------------------------------
+@app.get("/metrics", summary="Throughput and latency metrics")
+def get_metrics():
+    """Return per-operation counts, error rates, avg latency, and RPM."""
+    return metrics.snapshot()
 
 
 @app.get("/health", summary="Health check", include_in_schema=False)
