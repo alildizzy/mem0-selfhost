@@ -1,5 +1,5 @@
 {
-  "description": "mem0 auto-recall and auto-capture hooks for Claude Code",
+  "description": "mem0 auto-recall, continuous capture, and error recall hooks",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,6 +7,23 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mem0-recall.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mem0-user-capture.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mem0-post-tool.sh",
             "timeout": 5
           }
         ]
