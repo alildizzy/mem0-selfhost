@@ -767,3 +767,26 @@ def health():
 def home():
     """Redirect to the OpenAPI documentation."""
     return RedirectResponse(url="/docs")
+
+
+# ---------------------------------------------------------------------------
+# Versioned path aliases — clients (openclaw-mem0, MCP tools) try /v1/ and
+# /v2/ prefixed paths.  Route them to the canonical handlers above so callers
+# don't need fallback chains.
+# ---------------------------------------------------------------------------
+app.post("/v1/memories", include_in_schema=False)(add_memory)
+app.post("/v2/memories", include_in_schema=False)(add_memory)
+app.get("/v1/memories", include_in_schema=False)(get_all_memories)
+app.get("/v2/memories", include_in_schema=False)(get_all_memories)
+app.post("/v1/memories/search", include_in_schema=False)(search_memories)
+app.post("/v2/memories/search", include_in_schema=False)(search_memories)
+app.post("/v1/search", include_in_schema=False)(search_memories)
+app.post("/v2/search", include_in_schema=False)(search_memories)
+app.get("/v1/memories/{memory_id}", include_in_schema=False)(get_memory)
+app.get("/v2/memories/{memory_id}", include_in_schema=False)(get_memory)
+app.put("/v1/memories/{memory_id}", include_in_schema=False)(update_memory)
+app.put("/v2/memories/{memory_id}", include_in_schema=False)(update_memory)
+app.delete("/v1/memories/{memory_id}", include_in_schema=False)(delete_memory)
+app.delete("/v2/memories/{memory_id}", include_in_schema=False)(delete_memory)
+app.get("/v1/memories/{memory_id}/history", include_in_schema=False)(memory_history)
+app.get("/v2/memories/{memory_id}/history", include_in_schema=False)(memory_history)
