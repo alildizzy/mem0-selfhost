@@ -1,0 +1,27 @@
+{
+  "description": "mem0 auto-recall and auto-capture hooks for Claude Code",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mem0-recall.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/mem0-capture.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

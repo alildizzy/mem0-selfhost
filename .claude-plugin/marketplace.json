@@ -1,0 +1,13 @@
+{
+  "name": "mem0-selfhost",
+  "owner": {
+    "name": "Jonathan Irvin"
+  },
+  "plugins": [
+    {
+      "name": "mem0-selfhost",
+      "source": "./",
+      "description": "Auto-recall and auto-capture hooks for self-hosted mem0"
+    }
+  ]
+}

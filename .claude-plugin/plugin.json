@@ -1,0 +1,11 @@
+{
+  "name": "mem0-selfhost",
+  "version": "1.0.0",
+  "description": "Auto-recall and auto-capture hooks for self-hosted mem0. Injects relevant memories before each prompt and extracts knowledge after each response.",
+  "author": {
+    "name": "Jonathan Irvin",
+    "url": "https://github.com/offendingcommit"
+  },
+  "repository": "https://github.com/offendingcommit/mem0-selfhost",
+  "keywords": ["memory", "mem0", "recall", "capture"]
+}
