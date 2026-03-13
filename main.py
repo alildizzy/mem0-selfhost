@@ -3,9 +3,12 @@ import logging
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
+from contextvars import ContextVar
 from threading import Lock
 from typing import Any, Dict, List, Optional
+
+_request_id: ContextVar[str] = ContextVar("request_id", default="-")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -45,7 +48,9 @@ def log_with_data(level: int, msg: str, **kwargs):
     record = logger.makeRecord(
         logger.name, level, "(mem0)", 0, msg, (), None,
     )
-    record.extra_data = kwargs
+    entry = {"request_id": _request_id.get()}
+    entry.update(kwargs)
+    record.extra_data = entry
     logger.handle(record)
 
 
@@ -53,34 +58,56 @@ def log_with_data(level: int, msg: str, **kwargs):
 # In-memory throughput metrics
 # ---------------------------------------------------------------------------
 class Metrics:
+    _RPM_WINDOW = 60.0
+
     def __init__(self):
         self._lock = Lock()
         self._counts: Dict[str, int] = defaultdict(int)
         self._durations: Dict[str, float] = defaultdict(float)
         self._errors: Dict[str, int] = defaultdict(int)
+        self._timestamps: Dict[str, deque] = defaultdict(deque)
+        self._user_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._start_time = time.time()
 
-    def record(self, operation: str, duration_ms: float, error: bool = False):
+    def record(self, operation: str, duration_ms: float, error: bool = False,
+               user_id: Optional[str] = None):
+        now = time.time()
         with self._lock:
             self._counts[operation] += 1
             self._durations[operation] += duration_ms
             if error:
                 self._errors[operation] += 1
+            ts = self._timestamps[operation]
+            ts.append(now)
+            cutoff = now - self._RPM_WINDOW
+            while ts and ts[0] < cutoff:
+                ts.popleft()
+            if user_id:
+                self._user_counts[user_id][operation] += 1
 
     def snapshot(self) -> dict:
+        now = time.time()
         with self._lock:
-            uptime = time.time() - self._start_time
+            uptime = now - self._start_time
             ops = {}
             for op in self._counts:
                 count = self._counts[op]
+                ts = self._timestamps[op]
+                cutoff = now - self._RPM_WINDOW
+                while ts and ts[0] < cutoff:
+                    ts.popleft()
                 ops[op] = {
                     "count": count,
                     "errors": self._errors.get(op, 0),
                     "total_ms": round(self._durations[op], 1),
                     "avg_ms": round(self._durations[op] / count, 1) if count else 0,
-                    "rpm": round(count / (uptime / 60), 1) if uptime > 0 else 0,
+                    "rpm": len(ts),
                 }
             return {"uptime_s": round(uptime, 1), "operations": ops}
+
+    def user_snapshot(self) -> dict:
+        with self._lock:
+            return {uid: dict(ops) for uid, ops in self._user_counts.items()}
 
 
 metrics = Metrics()
@@ -219,6 +246,15 @@ _OpenAILLM._parse_response = _safe_parse_response
 _orig_openai_generate = _OpenAILLM.generate_response
 
 def _instrumented_openai_generate(self, messages, response_format=None, tools=None, tool_choice="auto"):
+    _orig_create = self.client.chat.completions.create
+
+    def _capturing_create(*args, **kwargs):
+        resp = _orig_create(*args, **kwargs)
+        self._last_response = resp
+        return resp
+
+    self.client.chat.completions.create = _capturing_create
+
     start = time.perf_counter()
     try:
         result = _orig_openai_generate(self, messages, response_format, tools, tool_choice)
@@ -247,6 +283,8 @@ def _instrumented_openai_generate(self, messages, response_format=None, tools=No
         )
         metrics.record("llm_call", duration_ms, error=True)
         raise
+    finally:
+        self.client.chat.completions.create = _orig_create
 
 _OpenAILLM.generate_response = _instrumented_openai_generate
 
@@ -352,6 +390,7 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         request_id = str(uuid.uuid4())[:8]
+        _request_id.set(request_id)
         start = time.perf_counter()
 
         response = await call_next(request)
@@ -437,7 +476,7 @@ def add_memory(memory_create: MemoryCreate):
             entities_deleted=entities_deleted,
             duration_ms=round(duration_ms, 1),
         )
-        metrics.record("add_memory", duration_ms)
+        metrics.record("add_memory", duration_ms, user_id=memory_create.user_id)
         return JSONResponse(content=response)
     except Exception as e:
         duration_ms = (time.perf_counter() - start) * 1000
@@ -448,7 +487,7 @@ def add_memory(memory_create: MemoryCreate):
             error=str(e),
             duration_ms=round(duration_ms, 1),
         )
-        metrics.record("add_memory", duration_ms, error=True)
+        metrics.record("add_memory", duration_ms, error=True, user_id=memory_create.user_id)
         logger.exception("Error in add_memory:")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -477,11 +516,11 @@ def get_all_memories(
             result_count=result_count,
             duration_ms=round(duration_ms, 1),
         )
-        metrics.record("list_memories", duration_ms)
+        metrics.record("list_memories", duration_ms, user_id=user_id)
         return result
     except Exception as e:
         duration_ms = (time.perf_counter() - start) * 1000
-        metrics.record("list_memories", duration_ms, error=True)
+        metrics.record("list_memories", duration_ms, error=True, user_id=user_id)
         logger.exception("Error in get_all_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -511,11 +550,11 @@ def count_memories(
             user_id=user_id, count=count, relations_count=rel_count,
             duration_ms=round(duration_ms, 1),
         )
-        metrics.record("count_memories", duration_ms)
+        metrics.record("count_memories", duration_ms, user_id=user_id)
         return {"count": count, "relations_count": rel_count}
     except Exception as e:
         duration_ms = (time.perf_counter() - start) * 1000
-        metrics.record("count_memories", duration_ms, error=True)
+        metrics.record("count_memories", duration_ms, error=True, user_id=user_id)
         logger.exception("Error in count_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -557,11 +596,11 @@ def search_memories(search_req: SearchRequest):
             top_score=round(top_score, 3) if top_score is not None else None,
             duration_ms=round(duration_ms, 1),
         )
-        metrics.record("search_memory", duration_ms)
+        metrics.record("search_memory", duration_ms, user_id=search_req.user_id)
         return result
     except Exception as e:
         duration_ms = (time.perf_counter() - start) * 1000
-        metrics.record("search_memory", duration_ms, error=True)
+        metrics.record("search_memory", duration_ms, error=True, user_id=search_req.user_id)
         logger.exception("Error in search_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -645,13 +684,13 @@ def delete_all_memories(
         duration_ms = (time.perf_counter() - start) * 1000
 
         log_with_data(logging.WARNING, "memory_delete_all",
-            user_id=user_id, duration_ms=round(duration_ms, 1),
+            **params, duration_ms=round(duration_ms, 1),
         )
-        metrics.record("delete_all", duration_ms)
+        metrics.record("delete_all", duration_ms, user_id=user_id)
         return {"message": "All relevant memories deleted"}
     except Exception as e:
         duration_ms = (time.perf_counter() - start) * 1000
-        metrics.record("delete_all", duration_ms, error=True)
+        metrics.record("delete_all", duration_ms, error=True, user_id=user_id)
         logger.exception("Error in delete_all_memories:")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -680,6 +719,42 @@ def reset_memory():
 def get_metrics():
     """Return per-operation counts, error rates, avg latency, and RPM."""
     return metrics.snapshot()
+
+
+@app.get("/metrics/users", summary="Per-user memory metrics")
+def get_user_metrics():
+    """Return per-user memory counts from postgres + per-user operation counts."""
+    import psycopg
+    dsn = f"host={POSTGRES_HOST} port={POSTGRES_PORT} dbname={POSTGRES_DB} user={POSTGRES_USER} password={POSTGRES_PASSWORD}"
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        payload->>'user_id' AS user_id,
+                        COUNT(*) AS memory_count
+                    FROM {}
+                    WHERE payload->>'user_id' IS NOT NULL
+                    GROUP BY payload->>'user_id'
+                    ORDER BY memory_count DESC
+                """.format(POSTGRES_COLLECTION_NAME))
+                rows = cur.fetchall()
+
+        store_counts = {row[0]: row[1] for row in rows}
+    except Exception as e:
+        logger.warning(f"Failed to query postgres for user counts: {e}")
+        store_counts = {}
+
+    throughput = metrics.user_snapshot()
+
+    users = {}
+    for uid in set(list(store_counts.keys()) + list(throughput.keys())):
+        users[uid] = {
+            "memories": store_counts.get(uid, 0),
+            "operations": throughput.get(uid, {}),
+        }
+
+    return {"users": users}
 
 
 @app.get("/health", summary="Health check", include_in_schema=False)
