@@ -48,8 +48,10 @@ Local build: `cd mcp && pnpm install && pnpm run build`
 
 ## Commit Convention
 
+Commits are authored and signed by Jonathan (`offendingcommit`). Do not use `--no-gpg-sign` or override `--author`.
+
 ```bash
-git commit --author="Daphne Nightingale <daphne@dopaminesoundlabs.com>" --no-gpg-sign -m "type(scope): description"
+git commit -m "type(scope): description"
 ```
 
 ## Warnings

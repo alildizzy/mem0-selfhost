@@ -56,7 +56,7 @@ curl http://localhost:8888/memories?user_id=daphne-nightingale&limit=5
 - **LLM:** OpenAI (`gpt-4.1-mini`) for fact extraction — `main.py` retains Anthropic patches (`tool_use`, `top_p` conflict) if provider is switched back
 - **Neo4j:** Enabled — `main.py` monkeypatches `sanitize_relationship_for_cypher` (allowlist regex) and `_remove_spaces_from_entities` (missing-key guard) to fix upstream Cypher bugs
 - **Port 8888:** Hardcoded in the OpenClaw plugin (`openclaw-mem0`) — don't change without updating both
-- **Git identity:** All commits as `Daphne Nightingale <daphne@dopaminesoundlabs.com>` with `--no-gpg-sign`
+- **Git identity:** Commits authored and signed by Jonathan (`offendingcommit`) — do not use `--no-gpg-sign` or override `--author`
 - **Never merge PRs** without Jonathan's review
 
 ## Related
