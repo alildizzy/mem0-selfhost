@@ -3,9 +3,12 @@ import logging
 import os
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
+from contextvars import ContextVar
 from threading import Lock
 from typing import Any, Dict, List, Optional
+
+_request_id: ContextVar[str] = ContextVar("request_id", default="-")
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -45,7 +48,9 @@ def log_with_data(level: int, msg: str, **kwargs):
     record = logger.makeRecord(
         logger.name, level, "(mem0)", 0, msg, (), None,
     )
-    record.extra_data = kwargs
+    entry = {"request_id": _request_id.get()}
+    entry.update(kwargs)
+    record.extra_data = entry
     logger.handle(record)
 
 
@@ -53,32 +58,46 @@ def log_with_data(level: int, msg: str, **kwargs):
 # In-memory throughput metrics
 # ---------------------------------------------------------------------------
 class Metrics:
+    _RPM_WINDOW = 60.0
+
     def __init__(self):
         self._lock = Lock()
         self._counts: Dict[str, int] = defaultdict(int)
         self._durations: Dict[str, float] = defaultdict(float)
         self._errors: Dict[str, int] = defaultdict(int)
+        self._timestamps: Dict[str, deque] = defaultdict(deque)
         self._start_time = time.time()
 
     def record(self, operation: str, duration_ms: float, error: bool = False):
+        now = time.time()
         with self._lock:
             self._counts[operation] += 1
             self._durations[operation] += duration_ms
             if error:
                 self._errors[operation] += 1
+            ts = self._timestamps[operation]
+            ts.append(now)
+            cutoff = now - self._RPM_WINDOW
+            while ts and ts[0] < cutoff:
+                ts.popleft()
 
     def snapshot(self) -> dict:
+        now = time.time()
         with self._lock:
-            uptime = time.time() - self._start_time
+            uptime = now - self._start_time
             ops = {}
             for op in self._counts:
                 count = self._counts[op]
+                ts = self._timestamps[op]
+                cutoff = now - self._RPM_WINDOW
+                while ts and ts[0] < cutoff:
+                    ts.popleft()
                 ops[op] = {
                     "count": count,
                     "errors": self._errors.get(op, 0),
                     "total_ms": round(self._durations[op], 1),
                     "avg_ms": round(self._durations[op] / count, 1) if count else 0,
-                    "rpm": round(count / (uptime / 60), 1) if uptime > 0 else 0,
+                    "rpm": len(ts),
                 }
             return {"uptime_s": round(uptime, 1), "operations": ops}
 
@@ -219,6 +238,15 @@ _OpenAILLM._parse_response = _safe_parse_response
 _orig_openai_generate = _OpenAILLM.generate_response
 
 def _instrumented_openai_generate(self, messages, response_format=None, tools=None, tool_choice="auto"):
+    _orig_create = self.client.chat.completions.create
+
+    def _capturing_create(*args, **kwargs):
+        resp = _orig_create(*args, **kwargs)
+        self._last_response = resp
+        return resp
+
+    self.client.chat.completions.create = _capturing_create
+
     start = time.perf_counter()
     try:
         result = _orig_openai_generate(self, messages, response_format, tools, tool_choice)
@@ -247,6 +275,8 @@ def _instrumented_openai_generate(self, messages, response_format=None, tools=No
         )
         metrics.record("llm_call", duration_ms, error=True)
         raise
+    finally:
+        self.client.chat.completions.create = _orig_create
 
 _OpenAILLM.generate_response = _instrumented_openai_generate
 
@@ -352,6 +382,7 @@ class ObservabilityMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         request_id = str(uuid.uuid4())[:8]
+        _request_id.set(request_id)
         start = time.perf_counter()
 
         response = await call_next(request)
